@@ -22,6 +22,8 @@ app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
+
+# السماح بالمنافذ المحلية ومنافذ ريلواي مستقبلاً
 CORS(app, origins=["http://localhost:3000", "http://localhost:3001"])
 
 reset_tokens = {}
@@ -243,4 +245,6 @@ def reset_password():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(debug=True, port=5000)
+    # لتسهيل التشغيل على ريلواي يفضل قراءة البورت من البيئة
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=True, host='0.0.0.0', port=port)
