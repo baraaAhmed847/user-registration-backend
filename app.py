@@ -24,11 +24,9 @@ bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
 # السماح بالمنافذ المحلية ومنافذ ريلواي مستقبلاً
-CORS(app, origins=[
-    "http://localhost:3000",
-    "http://localhost:3001",
-    os.getenv("FRONTEND_URL")
-], supports_credentials=True)
+from flask_cors import CORS, cross_origin
+
+CORS(app)
 reset_tokens = {}
 
 class User(db.Model):
