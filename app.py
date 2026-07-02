@@ -1,12 +1,20 @@
+import os
+import re
+import secrets
+import traceback
+from datetime import datetime, timedelta
+
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required,
+    get_jwt_identity, get_jwt
+)
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
-import os
-import secrets
-import traceback
 import resend
 
 load_dotenv()
@@ -17,9 +25,13 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL')
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=2)
+
+# Only ever run in debug mode locally, never in production
+DEBUG_MODE = os.getenv('FLASK_ENV') == 'development'
 
 CORS(app, resources={r"/api/*": {
-    "origins": ["https://user-registration-frontend-production.up.railway.app"],
+    "origins": [os.getenv('FRONTEND_URL', 'https://user-registration-frontend-production.up.railway.app')],
     "supports_credentials": True,
     "allow_headers": ["Content-Type", "Authorization"],
     "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
@@ -28,13 +40,26 @@ CORS(app, resources={r"/api/*": {
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
-reset_tokens = {}
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"  # swap for redis:// in a multi-instance deployment
+)
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
 class User(db.Model):
     __tablename__ = 'user'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(150), unique=True, nullable=False)
+    email = db.Column(db.String(150), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     profile_image = db.Column(db.String(255))
     bio = db.Column(db.Text)
@@ -51,47 +76,122 @@ class User(db.Model):
         }
 
 
+class PasswordResetToken(db.Model):
+    """Persisted so a Railway restart / multi-worker deploy doesn't lose tokens."""
+    __tablename__ = 'password_reset_token'
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used = db.Column(db.Boolean, default=False, nullable=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+
+class TokenBlocklist(db.Model):
+    """Revoked JWTs, so Logout actually invalidates the token instead of being a no-op."""
+    __tablename__ = 'token_blocklist'
+    id = db.Column(db.Integer, primary_key=True)
+    jti = db.Column(db.String(36), nullable=False, index=True, unique=True)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+
+@jwt.token_in_blocklist_loader
+def check_if_token_revoked(jwt_header, jwt_payload):
+    jti = jwt_payload["jti"]
+    return db.session.query(TokenBlocklist.id).filter_by(jti=jti).scalar() is not None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def validate_password_strength(password):
+    if len(password) < 8:
+        return "كلمة المرور لازم تكون 8 حروف على الأقل"
+    if not re.search(r"[A-Za-z]", password) or not re.search(r"[0-9]", password):
+        return "كلمة المرور لازم تحتوي على حروف وأرقام"
+    return None
+
+
+def error(message, code):
+    return jsonify({"error": message}), code
+
+
+def handle_db_error(e):
+    db.session.rollback()
+    traceback.print_exc()
+    return error("حصل خطأ، حاول مرة تانية", 500)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.route('/api/register', methods=['POST'])
+@limiter.limit("10 per hour")
 def register():
-    data = request.get_json()
-    name = data.get('name')
-    email = data.get('email')
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()
+    email = (data.get('email') or '').strip().lower()
     password = data.get('password')
     confirm_password = data.get('confirm_password')
 
     if not name or not email or not password or not confirm_password:
-        return jsonify({"error": "من فضلك اكتب كل البيانات المطلوبة"}), 400
+        return error("من فضلك اكتب كل البيانات المطلوبة", 400)
+
+    if not EMAIL_RE.match(email):
+        return error("البريد الإلكتروني غير صحيح", 400)
 
     if password != confirm_password:
-        return jsonify({"error": "كلمتا المرور غير متطابقتين"}), 400
+        return error("كلمتا المرور غير متطابقتين", 400)
 
-    if User.query.filter_by(email=email).first():
-        return jsonify({"error": "البريد الإلكتروني مستخدم قبل كده"}), 400
+    strength_error = validate_password_strength(password)
+    if strength_error:
+        return error(strength_error, 400)
 
-    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
-    new_user = User(name=name, email=email, password_hash=hashed_password)
-    db.session.add(new_user)
-    db.session.commit()
+    try:
+        if User.query.filter_by(email=email).first():
+            return error("البريد الإلكتروني مستخدم قبل كده", 400)
 
-    return jsonify({"message": "تم إنشاء الحساب بنجاح", "user": new_user.to_dict()}), 201
+        hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+        new_user = User(name=name, email=email, password_hash=hashed_password)
+        db.session.add(new_user)
+        db.session.commit()
+    except Exception as e:
+        return handle_db_error(e)
+
+    access_token = create_access_token(identity=str(new_user.id))
+    return jsonify({
+        "message": "تم إنشاء الحساب بنجاح",
+        "token": access_token,
+        "user": new_user.to_dict()
+    }), 201
 
 
 @app.route('/api/login', methods=['POST'])
+@limiter.limit("10 per minute")
 def login():
-    data = request.get_json()
-    email = data.get('email')
+    data = request.get_json(silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
     password = data.get('password')
 
     if not email or not password:
-        return jsonify({"error": "من فضلك اكتب كل البيانات المطلوبة"}), 400
+        return error("من فضلك اكتب كل البيانات المطلوبة", 400)
 
-    user = User.query.filter_by(email=email).first()
+    try:
+        user = User.query.filter_by(email=email).first()
+    except Exception as e:
+        return handle_db_error(e)
 
     if not user or not bcrypt.check_password_hash(user.password_hash, password):
-        return jsonify({"error": "البريد الإلكتروني أو كلمة المرور غير صحيحة"}), 401
+        return error("البريد الإلكتروني أو كلمة المرور غير صحيحة", 401)
 
     access_token = create_access_token(identity=str(user.id))
-    return jsonify({"message": "تم تسجيل الدخول بنجاح", "token": access_token, "user": user.to_dict()}), 200
+    return jsonify({
+        "message": "تم تسجيل الدخول بنجاح",
+        "token": access_token,
+        "user": user.to_dict()
+    }), 200
 
 
 @app.route('/api/profile', methods=['GET'])
@@ -101,7 +201,7 @@ def get_profile():
     user = User.query.get(user_id)
 
     if not user:
-        return jsonify({"error": "المستخدم غير موجود"}), 404
+        return error("المستخدم غير موجود", 404)
 
     return jsonify(user.to_dict()), 200
 
@@ -113,16 +213,22 @@ def update_profile():
     user = User.query.get(user_id)
 
     if not user:
-        return jsonify({"error": "المستخدم غير موجود"}), 404
+        return error("المستخدم غير موجود", 404)
 
-    data = request.get_json()
-    new_name = data.get('name')
-    new_email = data.get('email')
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get('name') or '').strip() or None
+    new_email = (data.get('email') or '').strip().lower() or None
     bio = data.get('bio')
+    profile_image = data.get('profile_image')
 
     if new_email and new_email != user.email:
-        if User.query.filter_by(email=new_email).first():
-            return jsonify({"error": "البريد الإلكتروني مستخدم قبل كده"}), 400
+        if not EMAIL_RE.match(new_email):
+            return error("البريد الإلكتروني غير صحيح", 400)
+        try:
+            if User.query.filter_by(email=new_email).first():
+                return error("البريد الإلكتروني مستخدم قبل كده", 400)
+        except Exception as e:
+            return handle_db_error(e)
         user.email = new_email
 
     if new_name:
@@ -131,7 +237,14 @@ def update_profile():
     if bio is not None:
         user.bio = bio
 
-    db.session.commit()
+    if profile_image is not None:
+        user.profile_image = profile_image
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        return handle_db_error(e)
+
     return jsonify({"message": "تم التعديل بنجاح", "user": user.to_dict()}), 200
 
 
@@ -142,47 +255,80 @@ def change_password():
     user = User.query.get(user_id)
 
     if not user:
-        return jsonify({"error": "المستخدم غير موجود"}), 404
+        return error("المستخدم غير موجود", 404)
 
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     old_password = data.get('old_password')
     new_password = data.get('new_password')
     confirm_new_password = data.get('confirm_new_password')
 
     if not old_password or not new_password or not confirm_new_password:
-        return jsonify({"error": "من فضلك اكتب كل البيانات المطلوبة"}), 400
+        return error("من فضلك اكتب كل البيانات المطلوبة", 400)
 
     if not bcrypt.check_password_hash(user.password_hash, old_password):
-        return jsonify({"error": "كلمة المرور القديمة غير صحيحة"}), 401
+        return error("كلمة المرور القديمة غير صحيحة", 401)
 
     if new_password != confirm_new_password:
-        return jsonify({"error": "كلمتا المرور غير متطابقتين"}), 400
+        return error("كلمتا المرور غير متطابقتين", 400)
 
-    user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
-    db.session.commit()
+    strength_error = validate_password_strength(new_password)
+    if strength_error:
+        return error(strength_error, 400)
+
+    try:
+        user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        db.session.commit()
+    except Exception as e:
+        return handle_db_error(e)
+
     return jsonify({"message": "تم تغيير كلمة المرور بنجاح"}), 200
 
 
 @app.route('/api/logout', methods=['POST'])
 @jwt_required()
 def logout():
+    jti = get_jwt()["jti"]
+    try:
+        db.session.add(TokenBlocklist(jti=jti))
+        db.session.commit()
+    except Exception as e:
+        return handle_db_error(e)
     return jsonify({"message": "تم تسجيل الخروج بنجاح"}), 200
 
 
 @app.route('/api/forgot-password', methods=['POST'])
+@limiter.limit("5 per hour")
 def forgot_password():
-    data = request.get_json()
-    email = data.get('email')
+    data = request.get_json(silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
 
-    user = User.query.filter_by(email=email).first()
+    if not email:
+        return error("من فضلك اكتب كل البيانات المطلوبة", 400)
+
+    try:
+        user = User.query.filter_by(email=email).first()
+    except Exception as e:
+        return handle_db_error(e)
+
+    # Respond identically whether or not the email exists, to avoid leaking
+    # which addresses are registered.
+    generic_response = jsonify({
+        "message": "لو البريد الإلكتروني موجود، هيوصلك رابط إعادة التعيين"
+    }), 200
+
     if not user:
-        return jsonify({"error": "البريد الإلكتروني غير موجود"}), 404
+        return generic_response
 
-    token = secrets.token_urlsafe(16)
-    reset_tokens[token] = {
-        "user_id": user.id,
-        "expires_at": __import__('time').time() + 900
-    }
+    token = secrets.token_urlsafe(32)
+    try:
+        db.session.add(PasswordResetToken(
+            token=token,
+            user_id=user.id,
+            expires_at=datetime.utcnow() + timedelta(minutes=15)
+        ))
+        db.session.commit()
+    except Exception as e:
+        return handle_db_error(e)
 
     reset_link = f"{os.getenv('FRONTEND_URL')}/reset-password/{token}"
 
@@ -208,44 +354,68 @@ def forgot_password():
                 </div>
             """
         })
-    except Exception as e:
+    except Exception:
+        # Don't leak email-provider errors to the client; log server-side only.
         traceback.print_exc()
-        return jsonify({"error": f"فشل إرسال الإيميل: {str(e)}"}), 500
 
-    return jsonify({"message": "تم إرسال رابط إعادة التعيين على بريدك الإلكتروني"}), 200
+    return generic_response
 
 
 @app.route('/api/reset-password', methods=['POST'])
+@limiter.limit("10 per hour")
 def reset_password():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     token = data.get('token')
     new_password = data.get('new_password')
     confirm_new_password = data.get('confirm_new_password')
 
-    if token not in reset_tokens:
-        return jsonify({"error": "الرابط غير صحيح أو منتهي الصلاحية"}), 400
+    if not token or not new_password or not confirm_new_password:
+        return error("من فضلك اكتب كل البيانات المطلوبة", 400)
 
-    token_data = reset_tokens[token]
-    if __import__('time').time() > token_data['expires_at']:
-        reset_tokens.pop(token)
-        return jsonify({"error": "انتهت صلاحية الرابط، اطلب رابطاً جديداً"}), 400
+    try:
+        token_row = PasswordResetToken.query.filter_by(token=token, used=False).first()
+    except Exception as e:
+        return handle_db_error(e)
+
+    if not token_row:
+        return error("الرابط غير صحيح أو منتهي الصلاحية", 400)
+
+    if datetime.utcnow() > token_row.expires_at:
+        return error("انتهت صلاحية الرابط، اطلب رابطاً جديداً", 400)
 
     if new_password != confirm_new_password:
-        return jsonify({"error": "كلمتا المرور غير متطابقتين"}), 400
+        return error("كلمتا المرور غير متطابقتين", 400)
 
-    user_id = reset_tokens.pop(token)['user_id']
-    user = User.query.get(user_id)
+    strength_error = validate_password_strength(new_password)
+    if strength_error:
+        return error(strength_error, 400)
 
+    user = User.query.get(token_row.user_id)
     if not user:
-        return jsonify({"error": "المستخدم غير موجود"}), 404
+        return error("المستخدم غير موجود", 404)
 
-    user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
-    db.session.commit()
+    try:
+        user.password_hash = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        token_row.used = True
+        db.session.commit()
+    except Exception as e:
+        return handle_db_error(e)
+
     return jsonify({"message": "تم تغيير كلمة المرور بنجاح"}), 200
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return error("الصفحة غير موجودة", 404)
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    return error("حصل خطأ، حاول مرة تانية", 500)
 
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    app.run(debug=DEBUG_MODE, host='0.0.0.0', port=port)
