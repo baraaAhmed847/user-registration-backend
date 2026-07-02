@@ -1,9 +1,8 @@
-from flask_cors import CORS, request, jsonify
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from flask_cors import CORS
-app = Flask(__name__)
 
 from dotenv import load_dotenv
 import os
@@ -25,12 +24,11 @@ bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
 # السماح بالمنافذ المحلية ومنافذ ريلواي مستقبلاً
-CORS(
-    app,
-    resources={"/api/*": {
-        "origins": "https://user-registration-frontend-production.up.railway.app"
-    }}
-)
+CORS(app, origins=[
+    "http://localhost:3000",
+    "http://localhost:3001",
+    os.getenv("FRONTEND_URL")
+], supports_credentials=True)
 reset_tokens = {}
 
 class User(db.Model):
